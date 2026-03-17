@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Warehouse Dashboard V12 (Auto Sync)</title>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+<style>
+body{font-family:Inter,Arial;background:#eef2f7;margin:0}
+.wrapper{padding:20px}
+.header{font-size:28px;font-weight:800;margin-bottom:15px}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px}
+.btn,select{padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:white}
+.btn.active{background:#ff7a2f;color:white}
+.card{background:white;border-radius:12px;padding:15px;margin-bottom:15px}
+.chart{height:320px;display:flex;align-items:flex-end;gap:10px;overflow-x:auto}
+.bar{width:40px;background:#ff7a2f;border-radius:6px;position:relative;transition:.2s}
+.bar:hover{background:#222}
+.tooltip{position:absolute;background:#111;color:white;padding:6px 8px;font-size:11px;border-radius:6px;display:none;white-space:nowrap;top:-30px}
+.bar:hover .tooltip{display:block}
+.slot-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+.slot{background:#f4f6fb;padding:20px;text-align:center;border-radius:10px;font-weight:700}
+</style>
+</head>
+
+<body>
+<div class="wrapper">
+
+<div style="background:#1e2a38;color:white;padding:15px;border-radius:10px;margin-bottom:15px">
+  <div style="font-size:18px;font-weight:700">Transportation Dashboard Control</div>
+  <div style="font-size:12px;opacity:.8">Analysis & Monitoring Dashboard</div>
+</div>
+
+<div id="syncStatus" style="background:#e6f4ea;color:#1e7e34;padding:10px 14px;border-radius:10px;margin-bottom:15px;font-size:13px;font-weight:600">
+⏳ Loading data...
+</div>
+
+<div class="header">Dashboard</div>
+
+<div class="toolbar">
+<select id="groupBy">
+<option value="zone">Group: Zone</option>
+<option value="wh">Group: WH</option>
+<option value="line">Group: Line</option>
+</select>
+
+<select id="measure">
+<option value="unit">Unit</option>
+<option value="pallet">Pallet</option>
+<option value="trip">Trip</option>
+</select>
+
+<select id="monthFilter"><option value="ALL">All Month</option></select>
+</div>
+
+<div class="card">
+<div class="chart" id="chart"></div>
+</div>
+
+<div class="header">Zone Delivery Recommendation</div>
+
+<div class="toolbar">
+<select id="dateFilter"></select>
+</div>
+
+<div class="card">
+<div class="slot-grid" id="slots"></div>
+</div>
+
+</div>
+
+<div class="header">Missing Material (Unmatched)</div>
+<div class="card">
+  <div id="missingList" style="font-size:13px"></div>
+</div>
+
+<script>
+// ===== URLs (FROM YOU) =====
+const MASTER_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSccXoDFxsQ56dmGkPYNgozbiYTbYUZ6wZxUBrZjHlEEHYYnBfR_dOOi2JmdVYPBw/pub?output=csv"
+const PROD_URL   = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRGz4nHaMMnpXOgmw7m4WGmmbC0pRBAHEO8W0DLuVaBuixqdxQd3CXoharikLR9mw/pub?output=csv"
+
+let masterData = {}
+let dailyData = []
+
+// ===== SIMPLE CSV PARSER (handles quotes) =====
+function parseCSV(text){
+ const rows=[]
+ let cur="", row=[], inQuotes=false
+ for(let i=0;i<text.length;i++){
+  let c=text[i]
+  if(c==='"'){
+    if(inQuotes && text[i+1]==='"'){cur+='"';i++}
+    else inQuotes=!inQuotes
+  }else if(c===',' && !inQuotes){row.push(cur);cur=""}
+  else if((c==='\n' || c==='\r') && !inQuotes){
+    if(cur!==''||row.length){row.push(cur);rows.push(row);row=[];cur=""}
+  }else{cur+=c}
+ }
+ if(cur!==''||row.length){row.push(cur);rows.push(row)}
+ return rows
+}
+
+function toJSON(rows){
+ const headers = rows[0].map(h=>h.trim())
+ return rows.slice(1).map(r=>{
+  let obj={}
+  headers.forEach((h,i)=>obj[h]= (r[i]||"").trim())
+  return obj
+ })
+}
+
+// ===== LOAD MASTER =====
+async function loadMaster(){
+ const res = await fetch(MASTER_URL)
+ const text = await res.text()
+ const rows = parseCSV(text)
+ const data = toJSON(rows)
+
+ masterData = {}
+ data.forEach(r=>{
+  let model = (r.Material || r.model || r.Model || r.MATERIAL || "").toUpperCase().trim()
+  if(!model) return
+  masterData[model] = {
+   zone:(r.zone||r.Zone||"").toUpperCase(),
+   wh:(r.wh||r.WH||r.Warehouse||"").toUpperCase(),
+   packkey:Number(r.packkey||r.Packkey||r.PackKey||1)
+  }
+ })
+}
+
+// ===== LOAD PRODUCTION =====
+async function loadProduction(){
+ const res = await fetch(PROD_URL)
+ const text = await res.text()
+ const rows = parseCSV(text)
+ const data = toJSON(rows)
+
+ dailyData = data
+ process()
+}
+
+// ===== PROCESS =====
+function getVal(obj, keys){
+ for(let k of keys){
+  if(obj[k]!==undefined) return obj[k]
+ }
+ return ""
+}
+
+function process(){
+ let map={}
+ let missingMap={} // เก็บ material ที่หาไม่เจอ
+ let months=new Set()
+
+ dailyData.forEach(r=>{
+  let model=(getVal(r,["Material","material","Model","model"])||"").toUpperCase()
+  let unit=Number(getVal(r,["Order Quantity","Order Qty","Qty","quantity","Quantity"])||0)
+  let rawDate = getVal(r,["Start Date","Date","start date","Production Date","Unit Start Date"]) 
+ let date
+ if(rawDate && rawDate.includes("/")){
+   let parts = rawDate.split("/")
+   date = new Date(parts[2], parts[1]-1, parts[0])
+ }else{
+   date = new Date(rawDate)
+ }
+  let line=getVal(r,["Production Line","Line","line","production line"])||"UNKNOWN"
+
+  if(!masterData[model]){
+   if(!missingMap[model]) missingMap[model]=0
+   missingMap[model]+=1
+   return
+ }
+
+  let zone=masterData[model].zone
+  let wh=masterData[model].wh
+  let pallet=unit/(masterData[model].packkey||1)
+  let trip=pallet/9
+
+  let d=date.toISOString().slice(0,10)
+  let m=d.slice(0,7)
+  months.add(m)
+
+  if(!map[d]) map[d]=[]
+  map[d].push({zone,wh,line,unit,pallet,trip})
+ })
+
+ // month filter
+ monthFilter.innerHTML='<option value="ALL">All Month</option>'
+ months.forEach(m=>{
+  let op=document.createElement('option')
+  op.value=m
+  op.textContent=m
+  monthFilter.appendChild(op)
+ })
+
+ render(map)
+ renderMissing(missingMap)
+ renderDateFilter(map)
+}
+
+// ===== CHART =====
+function render(data){
+ const group=groupBy.value
+ const measure=measureSelect.value
+ const month=monthFilter.value
+ chart.innerHTML=""
+
+ Object.keys(data).sort().forEach(d=>{
+  if(month!="ALL" && !d.startsWith(month)) return
+
+  let agg={}
+  data[d].forEach(r=>{
+   let key=r[group]
+   if(!agg[key]) agg[key]=0
+   agg[key]+=r[measure]
+  })
+
+  let total=Object.values(agg).reduce((a,b)=>a+b,0)
+  let max = (measure==="unit")?20000:2000
+  let h=(total/max)*300
+
+  let bar=document.createElement("div")
+  bar.className="bar"
+  bar.style.height=h+"px"
+
+  let tooltip=document.createElement("div")
+  tooltip.className="tooltip"
+  tooltip.innerHTML = d+"<br>" + Object.entries(agg).map(x=>x[0]+": "+Math.round(x[1])).join("<br>")
+
+  bar.appendChild(tooltip)
+  chart.appendChild(bar)
+ })
+}
+
+// ===== DATE FILTER =====
+function renderDateFilter(data){
+ dateFilter.innerHTML=""
+ Object.keys(data).forEach(d=>{
+  let op=document.createElement('option')
+  op.value=d
+  op.textContent=d
+  dateFilter.appendChild(op)
+ })
+ dateFilter.onchange=()=>renderSlots(data[dateFilter.value])
+}
+
+// ===== SLOTS =====
+function renderSlots(rows){
+ slots.innerHTML=""
+ let site2=rows.filter(r=>r.wh=="SITE2")
+ let total=site2.reduce((a,b)=>a+b.pallet,0)
+
+ for(let i=0;i<6;i++){
+  let s=document.createElement("div")
+  s.className="slot"
+  let val=site2[i]?((site2[i].pallet/total)*100).toFixed(0):0
+  s.innerHTML=`${val}%<br>Slot ${i+1}`
+  slots.appendChild(s)
+ }
+}
+
+// ===== SHOW MISSING =====
+function renderMissing(missing){
+ const el = document.getElementById('missingList')
+ let keys = Object.keys(missing)
+
+ if(keys.length===0){
+   el.innerHTML = "✅ No missing material"
+   return
+ }
+
+ el.innerHTML = keys.map(k=>`❌ ${k} (used ${missing[k]} times)`).join("<br>")
+}
+
+// ===== AUTO SYNC =====
+async function init(){
+ const statusEl = document.getElementById('syncStatus')
+ try{
+  statusEl.innerHTML = '⏳ Loading Master...'
+  await loadMaster()
+
+  statusEl.innerHTML = '⏳ Loading Production...'
+  await loadProduction()
+
+  let now = new Date().toLocaleString()
+  statusEl.innerHTML = `✅ Database synchronized | Master + Production | Last: ${now}`
+  statusEl.style.background = '#e6f4ea'
+  statusEl.style.color = '#1e7e34'
+
+ }catch(e){
+  console.error(e)
+  statusEl.innerHTML = '❌ Sync failed (check sheet permission or column name)'
+  statusEl.style.background = '#fdecea'
+  statusEl.style.color = '#b71c1c'
+ }
+
+ await loadMaster()
+ await loadProduction()
+ console.log("AUTO SYNC READY")
+}
+
+init()
+setInterval(init,30000)
+
+[groupBy,measure,monthFilter].forEach(el=>{
+ el.onchange=()=>init()
+})
+
+</script>
+
+</body>
+</html>
